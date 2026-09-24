@@ -7,6 +7,8 @@ import ResultsDashboard from './components/ResultsDashboard';
 import ErrorMessage from './components/ErrorMessage';
 import HistoryView from './components/HistoryView';
 import HistoryDetailView from './components/HistoryDetailView';
+import DecisionCompareView from './components/DecisionCompareView';
+import DeadlineCenterView from './components/DeadlineCenterView';
 import PageTransition from './components/PageTransition';
 import {
   checkBackendHealth,
@@ -16,6 +18,9 @@ import {
   fetchHistory,
   fetchHistoryItem,
   deleteHistoryItem,
+  compareDocuments,
+  getDeadlines,
+  updateDeadlineCompletion,
 } from './api';
 
 export default function App() {
@@ -29,7 +34,7 @@ export default function App() {
   const [error, setError] = useState(null);
   const [lastAttempt, setLastAttempt] = useState(null);
 
-  /* ── Navigation: 'dashboard' | 'result' | 'new' | 'history' | 'history-detail' */
+  /* ── Navigation: 'dashboard' | 'result' | 'new' | 'history' | 'history-detail' | 'compare' */
   const [activeView, setActiveView] = useState('dashboard');
 
   /* ── History state ──────────────────────────────────────────────── */
@@ -38,6 +43,18 @@ export default function App() {
   const [historyError, setHistoryError] = useState(null);
   const [selectedHistoryItem, setSelectedHistoryItem] = useState(null);
   const [historyDetailLoading, setHistoryDetailLoading] = useState(false);
+
+  /* ── Decision Compare state ─────────────────────────────────────── */
+  const [comparisonResult, setComparisonResult] = useState(null);
+  const [isComparing, setIsComparing] = useState(false);
+  const [compareError, setCompareError] = useState(null);
+
+  /* ── Deadline Center state ───────────────────────────────────────── */
+  const [deadlineItems, setDeadlineItems] = useState([]);
+  const [deadlineCounts, setDeadlineCounts] = useState({});
+  const [deadlineLoading, setDeadlineLoading] = useState(false);
+  const [deadlineError, setDeadlineError] = useState(null);
+  const [updatingDeadlineDocId, setUpdatingDeadlineDocId] = useState(null);
 
   /* ── Health probe ───────────────────────────────────────────────── */
   useEffect(() => {
@@ -69,6 +86,63 @@ export default function App() {
     }
   }, []);
 
+  /* ── Load Deadlines ─────────────────────────────────────────────── */
+  const loadDeadlines = useCallback(async () => {
+    setDeadlineLoading(true);
+    setDeadlineError(null);
+    try {
+      const resp = await getDeadlines();
+      if (resp?.success) {
+        setDeadlineItems(resp.data || []);
+        setDeadlineCounts(resp.counts || {});
+      } else {
+        throw new Error(resp?.message || 'Failed to load deadlines.');
+      }
+    } catch (err) {
+      console.error('Failed to load deadlines:', err);
+      setDeadlineError(err.message || 'Failed to load deadlines from backend.');
+    } finally {
+      setDeadlineLoading(false);
+    }
+  }, []);
+
+  /* ── Toggle Deadline Completion ─────────────────────────────────── */
+  const handleUpdateDeadlineCompletion = async (documentId, completed) => {
+    setUpdatingDeadlineDocId(documentId);
+    try {
+      const resp = await updateDeadlineCompletion(documentId, completed);
+      if (resp?.success) {
+        // Optimistic UI update
+        setDeadlineItems((prev) =>
+          prev.map((item) =>
+            item.document_id === documentId
+              ? {
+                  ...item,
+                  completed,
+                  status: completed
+                    ? 'Completed'
+                    : (item.days_remaining < 0
+                        ? 'Overdue'
+                        : item.days_remaining <= 7
+                        ? 'Due Soon'
+                        : 'Upcoming'),
+                }
+              : item
+          )
+        );
+        // Refresh cleanly in background to synchronize counts
+        loadDeadlines();
+      } else {
+        throw new Error(resp?.message || 'Failed to update completion.');
+      }
+    } catch (err) {
+      console.error('Error updating completion:', err);
+      alert(err.message || 'Failed to update deadline status.');
+    } finally {
+      setUpdatingDeadlineDocId(null);
+    }
+  };
+
   // Load history on mount and when entering history/dashboard
   useEffect(() => {
     loadHistory();
@@ -91,7 +165,38 @@ export default function App() {
     } else if (view === 'history') {
       loadHistory();
       setActiveView('history');
+    } else if (view === 'compare') {
+      loadHistory();
+      setCompareError(null);
+      setActiveView('compare');
+    } else if (view === 'deadlines') {
+      loadDeadlines();
+      setActiveView('deadlines');
     }
+  };
+
+  /* ── Compare Handler ────────────────────────────────────────────── */
+  const handleCompare = async (selectedIds) => {
+    setIsComparing(true);
+    setCompareError(null);
+    try {
+      const resp = await compareDocuments(selectedIds);
+      if (resp?.success && resp?.data) {
+        setComparisonResult(resp.data);
+      } else {
+        throw new Error(resp?.message || 'Failed to compare decisions.');
+      }
+    } catch (err) {
+      console.error('Decision comparison error:', err);
+      setCompareError(err.message || 'Comparison failed. Please verify the backend connection.');
+    } finally {
+      setIsComparing(false);
+    }
+  };
+
+  const handleResetComparison = () => {
+    setComparisonResult(null);
+    setCompareError(null);
   };
 
   /* ── Analysis ───────────────────────────────────────────────────── */
@@ -291,6 +396,39 @@ export default function App() {
                 onNewAnalysis={() => handleNavigate('new')}
                 onRefresh={loadHistory}
                 onDeleteItem={handleDeleteFromList}
+                onNavigateToCompare={() => handleNavigate('compare')}
+              />
+            </PageTransition>
+          )}
+
+          {/* ── Decision Compare View ── */}
+          {!isAnalyzing && activeView === 'compare' && (
+            <PageTransition key="compare">
+              <DecisionCompareView
+                historyItems={historyItems}
+                isLoadingHistory={historyLoading}
+                onNewAnalysis={() => handleNavigate('new')}
+                onCompare={handleCompare}
+                isComparing={isComparing}
+                compareError={compareError}
+                comparisonResult={comparisonResult}
+                onResetComparison={handleResetComparison}
+              />
+            </PageTransition>
+          )}
+
+          {/* ── Deadline Center View ── */}
+          {!isAnalyzing && activeView === 'deadlines' && (
+            <PageTransition key="deadlines">
+              <DeadlineCenterView
+                deadlineItems={deadlineItems}
+                counts={deadlineCounts}
+                isLoading={deadlineLoading}
+                error={deadlineError}
+                onRefresh={loadDeadlines}
+                onUpdateCompletion={handleUpdateDeadlineCompletion}
+                onNewAnalysis={() => handleNavigate('new')}
+                updatingDocId={updatingDeadlineDocId}
               />
             </PageTransition>
           )}

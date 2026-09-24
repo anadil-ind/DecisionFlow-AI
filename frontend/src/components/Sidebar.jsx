@@ -1,10 +1,12 @@
 import React, { useState } from 'react';
-import { Layers, LayoutDashboard, Clock, Plus, Sparkles, Menu, X } from 'lucide-react';
+import { Layers, LayoutDashboard, Clock, Plus, Sparkles, Menu, X, GitCompare, CalendarClock } from 'lucide-react';
 
 const NAV_ITEMS = [
-  { id: 'dashboard', label: 'Dashboard',    Icon: LayoutDashboard },
-  { id: 'history',   label: 'History',      Icon: Clock },
-  { id: 'new',       label: 'New Analysis', Icon: Plus },
+  { id: 'dashboard', label: 'Dashboard',        Icon: LayoutDashboard },
+  { id: 'new',       label: 'New Analysis',     Icon: Plus },
+  { id: 'history',   label: 'History',          Icon: Clock },
+  { id: 'compare',   label: 'Decision Compare', Icon: GitCompare },
+  { id: 'deadlines', label: 'Deadline Center',  Icon: CalendarClock },
 ];
 
 export default function Sidebar({ activeView, onNavigate, historyCount = 0, backendConnected = true }) {
@@ -13,6 +15,8 @@ export default function Sidebar({ activeView, onNavigate, historyCount = 0, back
   const currentTab =
     activeView === 'result' ? 'dashboard' :
     activeView === 'history-detail' ? 'history' :
+    activeView === 'compare' ? 'compare' :
+    activeView === 'deadlines' ? 'deadlines' :
     activeView === 'new' ? 'new' :
     activeView;
 

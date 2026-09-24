@@ -207,3 +207,76 @@ export async function deleteHistoryItem(documentId) {
 
   return data;
 }
+
+/**
+ * Compare 2 or 3 analyzed documents side-by-side (scoped to current session)
+ * POST /compare
+ * Body: { "document_ids": [101, 102] }
+ */
+export async function compareDocuments(documentIds) {
+  if (!documentIds || !Array.isArray(documentIds) || documentIds.length < 2 || documentIds.length > 3) {
+    throw new Error('Please select between 2 and 3 documents to compare.');
+  }
+
+  const response = await fetch(`${API_BASE_URL}/compare`, {
+    method: 'POST',
+    headers: getStandardHeaders({
+      'Content-Type': 'application/json',
+    }),
+    body: JSON.stringify({ document_ids: documentIds.map(Number) }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const errorMsg = data?.detail || data?.message || `Comparison failed (HTTP ${response.status})`;
+    throw new Error(errorMsg);
+  }
+
+  return data;
+}
+
+/**
+ * Fetch all deadline items for the current session, categorized by status.
+ * GET /deadlines
+ */
+export async function getDeadlines() {
+  const response = await fetch(`${API_BASE_URL}/deadlines`, {
+    method: 'GET',
+    headers: getStandardHeaders(),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const errorMsg = data?.detail || `Failed to fetch deadlines (HTTP ${response.status})`;
+    throw new Error(errorMsg);
+  }
+
+  return data;
+}
+
+/**
+ * Toggle or update completion status for a deadline document.
+ * PATCH /deadlines/{document_id}
+ * Body: { "completed": boolean }
+ */
+export async function updateDeadlineCompletion(documentId, completed) {
+  const response = await fetch(`${API_BASE_URL}/deadlines/${documentId}`, {
+    method: 'PATCH',
+    headers: getStandardHeaders({
+      'Content-Type': 'application/json',
+    }),
+    body: JSON.stringify({ completed: Boolean(completed) }),
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    const errorMsg = data?.detail || `Failed to update deadline status (HTTP ${response.status})`;
+    throw new Error(errorMsg);
+  }
+
+  return data;
+}
+

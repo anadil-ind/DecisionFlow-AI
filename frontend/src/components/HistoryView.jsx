@@ -2,7 +2,7 @@ import React, { useState } from 'react';
 import {
   Clock, Calendar, Tag, AlertCircle, CheckCircle,
   RefreshCw, Plus, ChevronRight, FileText, Loader2,
-  Inbox, Trash2, X
+  Inbox, Trash2, X, GitCompare
 } from 'lucide-react';
 
 /* ── Shared mini-components ──────────────────────────────────────── */
@@ -71,6 +71,7 @@ export default function HistoryView({
   onNewAnalysis,
   onRefresh,
   onDeleteItem,   // (id) => Promise<void>
+  onNavigateToCompare,
 }) {
   const [deleteTarget, setDeleteTarget] = useState(null); // { id, title }
   const [isDeleting, setIsDeleting] = useState(false);
@@ -116,6 +117,17 @@ export default function HistoryView({
           {!isLoading && (
             <button id="btn-refresh-history" type="button" className="btn-secondary" onClick={onRefresh}>
               <RefreshCw size={14} /> Refresh
+            </button>
+          )}
+          {onNavigateToCompare && historyItems.length >= 2 && (
+            <button
+              id="btn-history-compare"
+              type="button"
+              className="btn-secondary"
+              onClick={onNavigateToCompare}
+              title="Compare 2–3 decisions side by side"
+            >
+              <GitCompare size={14} /> Compare Decisions
             </button>
           )}
           <button

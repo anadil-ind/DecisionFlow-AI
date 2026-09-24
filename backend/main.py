@@ -16,13 +16,31 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pypdf import PdfReader
 
-from models import AnalyzeRequest, AnalyzeResponse, HealthResponse, HistoryListResponse, HistoryDetailResponse, HistoryItem, DeleteResponse
+from models import (
+    AnalyzeRequest,
+    AnalyzeResponse,
+    HealthResponse,
+    HistoryListResponse,
+    HistoryDetailResponse,
+    HistoryItem,
+    DeleteResponse,
+    CompareRequest,
+    CompareResponse,
+    ComparisonResult,
+    DeadlineItem,
+    DeadlineListResponse,
+    UpdateCompletionRequest,
+    UpdateCompletionResponse,
+)
 from snowflake_client import (
     SnowflakeConfig,
     analyze_and_store_document,
     get_active_history,
     get_document_by_id,
     delete_document_by_id,
+    compare_documents_pipeline,
+    get_deadline_items,
+    update_deadline_completion,
 )
 from ocr_service import extract_text_from_image
 
@@ -595,6 +613,172 @@ async def delete_history_item(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete document: {str(exc)}",
+        )
+
+
+@app.post(
+    "/compare",
+    response_model=CompareResponse,
+    summary="Compare 2–3 Documents Side-by-Side",
+    tags=["Decision Compare"],
+)
+async def compare_documents(
+    payload: CompareRequest,
+    x_session_id: Optional[str] = Header(None),
+):
+    """
+    Compares 2 or 3 analyzed documents side-by-side:
+    1. Validates that 2 to 3 document IDs are provided.
+    2. Validates session ownership — only documents analyzed within the active user session can be compared.
+    3. Analyzes commonalities, differences, conflicts, deadlines, requirements, and missing info.
+    4. Generates an objective, action-oriented Decision Summary (strictly neutral, never chooses a winner).
+    5. Returns structured comparison intelligence.
+    """
+    if not payload.document_ids or len(payload.document_ids) < 2 or len(payload.document_ids) > 3:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Please select between 2 and 3 documents to compare.",
+        )
+
+    if not x_session_id or not str(x_session_id).strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session header (X-Session-ID) is missing. Cannot verify document ownership.",
+        )
+
+    if not SnowflakeConfig.is_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Snowflake credentials are not configured.",
+        )
+
+    try:
+        comparison = compare_documents_pipeline(
+            document_ids=payload.document_ids,
+            session_id=x_session_id,
+        )
+        logger.info(
+            "POST /compare (session=%s) successfully compared %d documents: %s",
+            x_session_id, len(payload.document_ids), payload.document_ids,
+        )
+        return CompareResponse(
+            success=True,
+            data=ComparisonResult(**comparison),
+            message=f"Successfully compared {len(payload.document_ids)} documents side-by-side.",
+        )
+    except ValueError as ve:
+        logger.warning("Comparison validation error: %s", ve)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve),
+        )
+    except Exception as exc:
+        logger.error("Error comparing documents: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to compare documents: {str(exc)}",
+        )
+
+
+@app.get("/deadlines", response_model=DeadlineListResponse, tags=["Deadline Center"])
+async def list_deadlines(x_session_id: Optional[str] = Header(None)):
+    """
+    Retrieve all deadline items for the current session, categorized by status:
+    Overdue, Due Soon, Upcoming, or Completed.
+    """
+    if not x_session_id or not x_session_id.strip():
+        logger.warning("GET /deadlines rejected: missing X-Session-ID header")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session ID header (X-Session-ID) is required to access deadlines.",
+        )
+
+    try:
+        raw_items = get_deadline_items(session_id=x_session_id.strip())
+        items = [DeadlineItem(**item) for item in raw_items]
+
+        # Compute dynamic counts per status category
+        counts = {
+            "Overdue": 0,
+            "Due Soon": 0,
+            "Upcoming": 0,
+            "Completed": 0,
+        }
+        for item in items:
+            if item.status in counts:
+                counts[item.status] += 1
+            else:
+                counts[item.status] = 1
+
+        logger.info(
+            "GET /deadlines (session=%s) returned %d items (counts=%s)",
+            x_session_id, len(items), counts,
+        )
+        return DeadlineListResponse(
+            success=True,
+            data=items,
+            counts=counts,
+        )
+    except Exception as exc:
+        logger.error("Error retrieving deadlines: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch deadlines: {str(exc)}",
+        )
+
+
+@app.patch("/deadlines/{document_id}", response_model=UpdateCompletionResponse, tags=["Deadline Center"])
+async def update_deadline_completion_status(
+    document_id: int,
+    payload: UpdateCompletionRequest,
+    x_session_id: Optional[str] = Header(None),
+):
+    """
+    Toggle completion status of a document deadline.
+    Persisted to the Snowflake DOCUMENTS table.
+    """
+    if not x_session_id or not x_session_id.strip():
+        logger.warning("PATCH /deadlines/%d rejected: missing X-Session-ID header", document_id)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Session ID header (X-Session-ID) is required to update deadline status.",
+        )
+
+    try:
+        updated = update_deadline_completion(
+            document_id=document_id,
+            completed=payload.completed,
+            session_id=x_session_id.strip(),
+        )
+        if not updated:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Document #{document_id} not found or does not belong to the current session.",
+            )
+
+        status_msg = "completed" if payload.completed else "incomplete"
+        logger.info(
+            "PATCH /deadlines/%d (session=%s) marked as %s",
+            document_id, x_session_id, status_msg,
+        )
+        return UpdateCompletionResponse(
+            success=True,
+            document_id=document_id,
+            completed=payload.completed,
+            message=f"Document deadline successfully marked as {status_msg}.",
+        )
+    except HTTPException:
+        raise
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(ve),
+        )
+    except Exception as exc:
+        logger.error("Error updating deadline completion for doc %d: %s", document_id, exc, exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update deadline status: {str(exc)}",
         )
 
 

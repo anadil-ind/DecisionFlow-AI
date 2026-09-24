@@ -86,11 +86,11 @@ def get_snowflake_connection():
     return snowflake.connector.connect(**conn_params)
 
 
-def parse_json_safely(raw_output: str) -> Dict[str, Any]:
+def extract_json_from_cortex(raw_output: str) -> Dict[str, Any]:
     """
-    Safely extracts and parses JSON from the Snowflake Cortex LLM output.
-    Handles JSON-encoded string responses, accidental markdown code fences,
-    surrounding commentary or whitespace, and repairs minor formatting quirks.
+    Safely extracts and parses any JSON dictionary from Snowflake Cortex LLM output.
+    Handles double JSON-encoding, accidental markdown code fences, preambles/epilogues,
+    trailing commas, and single quotes.
     """
     if not raw_output or not str(raw_output).strip():
         raise ValueError("Snowflake Cortex response was empty.")
@@ -98,7 +98,6 @@ def parse_json_safely(raw_output: str) -> Dict[str, Any]:
     text = str(raw_output).strip()
 
     # Step 1: Check if the response is JSON-encoded (e.g. "\"{\\n ... }\"")
-    # Snowflake connector often returns Cortex completions as JSON-serialized strings.
     data = None
     try:
         data = json.loads(text)
@@ -147,7 +146,16 @@ def parse_json_safely(raw_output: str) -> Dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("Snowflake Cortex response was not a valid JSON object.")
 
-    # Step 3: Standardize and validate required fields
+    return data
+
+
+def parse_json_safely(raw_output: str) -> Dict[str, Any]:
+    """
+    Safely extracts and standardizes document analysis JSON from Snowflake Cortex LLM output.
+    """
+    data = extract_json_from_cortex(raw_output)
+
+    # Standardize and validate required fields for DocumentAnalysis
     standardized = {
         "title": str(data.get("title") or "Untitled Document").strip(),
         "category": str(data.get("category") or "General").strip(),
@@ -164,13 +172,40 @@ def parse_json_safely(raw_output: str) -> Dict[str, Any]:
     return standardized
 
 
-def run_cortex_complete(text: str) -> str:
+def execute_cortex_prompt(prompt: str) -> str:
     """
-    Calls Snowflake Cortex AI_COMPLETE using the configured model (default: openai-gpt-5).
-    Falls back to SNOWFLAKE.CORTEX.COMPLETE if AI_COMPLETE is not available.
+    Executes an arbitrary prompt via Snowflake Cortex AI_COMPLETE (or SNOWFLAKE.CORTEX.COMPLETE)
+    using the configured model (default: openai-gpt-5).
     """
     model_name = SnowflakeConfig.cortex_model()
+    logger.info("Executing Snowflake Cortex call with model: %s", model_name)
 
+    conn = get_snowflake_connection()
+    try:
+        with conn.cursor() as cur:
+            # First attempt: Modern AI_COMPLETE function
+            try:
+                cur.execute("SELECT AI_COMPLETE(%s, %s)", (model_name, prompt))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0])
+            except ProgrammingError as pe:
+                logger.warning("AI_COMPLETE direct call failed (%s). Retrying with SNOWFLAKE.CORTEX.COMPLETE...", pe)
+                # Fallback attempt: SNOWFLAKE.CORTEX.COMPLETE
+                cur.execute("SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s)", (model_name, prompt))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0])
+
+            raise ValueError("Snowflake Cortex returned empty response.")
+    finally:
+        conn.close()
+
+
+def run_cortex_complete(text: str) -> str:
+    """
+    Calls Snowflake Cortex AI_COMPLETE for document analysis.
+    """
     system_prompt = (
         "You are DecisionFlow AI, an expert decision-intelligence engine. "
         "Analyze all provided information from the PDF, text, and images together.\n\n"
@@ -201,28 +236,7 @@ def run_cortex_complete(text: str) -> str:
         f"INFORMATION TO ANALYZE:\n{text}"
     )
 
-    logger.info("Executing Snowflake Cortex AI_COMPLETE with model: %s", model_name)
-
-    conn = get_snowflake_connection()
-    try:
-        with conn.cursor() as cur:
-            # First attempt: Modern AI_COMPLETE function
-            try:
-                cur.execute("SELECT AI_COMPLETE(%s, %s)", (model_name, system_prompt))
-                row = cur.fetchone()
-                if row and row[0]:
-                    return str(row[0])
-            except ProgrammingError as pe:
-                logger.warning("AI_COMPLETE direct call failed (%s). Retrying with SNOWFLAKE.CORTEX.COMPLETE...", pe)
-                # Fallback attempt: SNOWFLAKE.CORTEX.COMPLETE
-                cur.execute("SELECT SNOWFLAKE.CORTEX.COMPLETE(%s, %s)", (model_name, system_prompt))
-                row = cur.fetchone()
-                if row and row[0]:
-                    return str(row[0])
-
-            raise ValueError("Snowflake Cortex returned empty response.")
-    finally:
-        conn.close()
+    return execute_cortex_prompt(system_prompt)
 
 
 def inspect_table_columns(conn, table_name: str) -> Dict[str, Dict[str, str]]:
@@ -693,3 +707,676 @@ def delete_document_by_id(
         conn.close()
 
 
+def get_documents_by_ids(
+    document_ids: List[int],
+    session_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Retrieves multiple document records belonging to session_id from DOCUMENTS table.
+    Enforces strict session isolation: documents belonging to another session are never returned.
+    Preserves the exact order of document_ids requested.
+    """
+    if not document_ids or not session_id or not str(session_id).strip():
+        logger.info("get_documents_by_ids called without session_id or empty ids — returning empty list.")
+        return []
+
+    conn = get_snowflake_connection()
+    table_name = SnowflakeConfig.documents_table()
+    clean_ids = [int(i) for i in document_ids]
+    placeholders = ", ".join(["%s"] * len(clean_ids))
+
+    query = f"""
+    SELECT ID, TITLE, CATEGORY, SUMMARY, DEADLINE, PRIORITY, ACTIONS, REQUIRED_DOCUMENTS, CREATED_AT
+    FROM {table_name}
+    WHERE ID IN ({placeholders}) AND SESSION_ID = %s
+    """
+    params = tuple(clean_ids) + (str(session_id).strip(),)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            doc_map = {int(row[0]): _format_document_row(row) for row in rows}
+            return [doc_map[did] for did in clean_ids if did in doc_map]
+    finally:
+        conn.close()
+
+
+def format_deadline_display(deadline_val: Any) -> Optional[str]:
+    """Formats deadline string/date into clean readable format (e.g. '30 Sep 2026')."""
+    parsed = parse_deadline_date(deadline_val)
+    if parsed:
+        return parsed.strftime("%d %b %Y")
+    if deadline_val and str(deadline_val).strip() and str(deadline_val).lower() not in ("null", "none", "n/a"):
+        return str(deadline_val).strip()
+    return None
+
+
+def run_cortex_compare(documents: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Calls Snowflake Cortex AI (openai-gpt-5) to perform semantic comparison,
+    conflict identification, eligibility analysis, and factual summary generation.
+    Returns parsed dictionary or empty dict on failure.
+    """
+    option_letters = ["Option A", "Option B", "Option C"]
+    doc_sections = []
+    for idx, doc in enumerate(documents):
+        label = option_letters[idx] if idx < len(option_letters) else f"Option {idx + 1}"
+        docs_req = ", ".join(doc.get("required_documents") or []) or "None specified"
+        actions = ", ".join(doc.get("actions") or []) or "None specified"
+        dl = format_deadline_display(doc.get("deadline")) or "Not specified"
+        sec = (
+            f"=== {label}: {doc.get('title')} ===\n"
+            f"Category: {doc.get('category')}\n"
+            f"Deadline: {dl}\n"
+            f"Priority: {doc.get('priority')}\n"
+            f"Summary: {doc.get('summary')}\n"
+            f"Required Documents: {docs_req}\n"
+            f"Actions: {actions}"
+        )
+        doc_sections.append(sec)
+
+    docs_text = "\n\n".join(doc_sections)
+
+    prompt = (
+        "You are DecisionFlow AI, an impartial decision-comparison intelligence engine. "
+        "Analyze the following 2 or 3 official documents/options side by side.\n\n"
+        "Your task is to identify:\n"
+        "1. Common information across options (shared requirements, shared goals, or shared procedures).\n"
+        "2. Key differences between options (differing deadlines, priorities, document counts, eligibility, conditions).\n"
+        "3. Conflicting information (contradictory requirements, opposing instructions, or materially inconsistent criteria). "
+        "If there are no actual contradictions, you MUST return [\"No conflicting information detected.\"].\n"
+        "4. Important conditions (restrictions, GPA/age rules, verification instructions, or submission prerequisites).\n"
+        "5. Missing information (any missing deadlines, missing requirements, or unstated eligibility in any option).\n"
+        "6. Eligibility per option (concise summary of eligibility criteria for each option, e.g. 'Option A': '...', or 'Not available').\n"
+        "7. Decision Summary: 3-5 concise, action-oriented factual findings (e.g., 'Option A has an earlier deadline.', 'Option B requires one additional document.', 'Both options require a valid ID.').\n\n"
+        "CRITICAL RULES:\n"
+        "- Do NOT choose a winner.\n"
+        "- Do NOT declare which option is 'better', 'best', or 'recommended'.\n"
+        "- Do NOT tell the user which option to pick. Final decision belongs to the user.\n"
+        "- Return ONLY strictly factual and action-oriented statements.\n"
+        "- Return ONLY valid JSON. Double quotes for keys and strings. No markdown fences. No preamble.\n\n"
+        "Required JSON structure:\n"
+        "{\n"
+        '  "eligibility_per_option": {\n'
+        '    "Option A": "Eligibility summary or Not available",\n'
+        '    "Option B": "Eligibility summary or Not available"\n'
+        "  },\n"
+        '  "important_conditions_per_option": {\n'
+        '    "Option A": ["Condition 1", "Condition 2"],\n'
+        '    "Option B": ["Condition 1"]\n'
+        "  },\n"
+        '  "common_information": [\n'
+        '    "Factual common point 1",\n'
+        '    "Factual common point 2"\n'
+        "  ],\n"
+        '  "differences": [\n'
+        '    "Factual difference 1",\n'
+        '    "Factual difference 2"\n'
+        "  ],\n"
+        '  "conflicts": [\n'
+        '    "No conflicting information detected."\n'
+        "  ],\n"
+        '  "important_conditions": [\n'
+        '    "Condition 1",\n'
+        '    "Condition 2"\n'
+        "  ],\n"
+        '  "missing_information": [\n'
+        '    "Missing info point or No important information appears to be missing from the selected records."\n'
+        "  ],\n"
+        '  "decision_summary": [\n'
+        '    "Option A has an earlier deadline.",\n'
+        '    "Option B requires one additional document.",\n'
+        '    "Both options require a valid ID."\n'
+        "  ]\n"
+        "}\n\n"
+        f"DOCUMENTS TO COMPARE:\n{docs_text}"
+    )
+
+    try:
+        raw_resp = execute_cortex_prompt(prompt)
+        return extract_json_from_cortex(raw_resp)
+    except Exception as exc:
+        logger.warning("Cortex semantic comparison failed or unavailable: %s", exc)
+        return {}
+
+
+def _sanitize_summary_item(text: str) -> Optional[str]:
+    """
+    Enforces strict neutrality by removing or sanitizing non-factual or biased recommendations.
+    """
+    if not text or not str(text).strip():
+        return None
+    cleaned = str(text).strip()
+    lower = cleaned.lower()
+    forbidden = [
+        "is better", "is the best", "we recommend", "recommended option",
+        "winner", "should choose", "should select option", "superior choice",
+        "preferred choice", "you should choose", "you should pick",
+    ]
+    for f in forbidden:
+        if f in lower:
+            return None
+    return cleaned
+
+
+def build_decision_comparison(
+    documents: List[Dict[str, Any]],
+    cortex_data: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Synthesizes deterministic parameters (deadlines, priorities, document sets)
+    with Cortex AI semantic findings into a comprehensive comparison result.
+    Strictly neutral; never declares a winner.
+    """
+    cortex = cortex_data or {}
+    option_letters = ["Option A", "Option B", "Option C"]
+    num_docs = len(documents)
+
+    # 1. Build OptionDetail profiles
+    eligibility_map = cortex.get("eligibility_per_option") or {}
+    conditions_map = cortex.get("important_conditions_per_option") or {}
+
+    options_list = []
+    for idx, doc in enumerate(documents):
+        label = option_letters[idx] if idx < len(option_letters) else f"Option {idx + 1}"
+        elig = eligibility_map.get(label)
+        if not elig or elig.lower() in ("null", "none", "not available", "unknown", "n/a"):
+            elig = "Not available"
+
+        conds = conditions_map.get(label) or []
+        if isinstance(conds, str):
+            conds = [conds]
+
+        options_list.append({
+            "id": doc["id"],
+            "title": doc["title"],
+            "category": doc["category"],
+            "summary": doc["summary"],
+            "deadline": doc.get("deadline"),
+            "priority": doc.get("priority", "Medium"),
+            "actions": doc.get("actions", []),
+            "required_documents": doc.get("required_documents", []),
+            "eligibility": elig,
+            "important_conditions": [str(c).strip() for c in conds if c],
+        })
+
+    # 2. Deadline Comparison
+    different_deadlines: List[str] = []
+    parsed_dates = []
+    for idx, doc in enumerate(documents):
+        label = option_letters[idx]
+        p_date = parse_deadline_date(doc.get("deadline"))
+        parsed_dates.append((label, doc["title"], p_date, doc.get("deadline")))
+        d_display = format_deadline_display(doc.get("deadline"))
+        if d_display:
+            different_deadlines.append(f"{label} ({doc['title']}): {d_display}")
+        else:
+            different_deadlines.append(f"{label} ({doc['title']}): Deadline not available")
+
+    # Chronological / sequence relationship
+    dates_with_vals = [(lbl, title, pdate) for lbl, title, pdate, _ in parsed_dates if pdate is not None]
+    if len(dates_with_vals) >= 2:
+        dates_sorted = sorted(dates_with_vals, key=lambda x: x[2])
+        if num_docs == 2:
+            d1, d2 = dates_with_vals[0], dates_with_vals[1]
+            if d1[2] < d2[2]:
+                diff_days = (d2[2] - d1[2]).days
+                different_deadlines.append(
+                    f"{d1[0]} has an earlier deadline than {d2[0]} (by {diff_days} day{'s' if diff_days != 1 else ''})."
+                )
+            elif d2[2] < d1[2]:
+                diff_days = (d1[2] - d2[2]).days
+                different_deadlines.append(
+                    f"{d2[0]} has an earlier deadline than {d1[0]} (by {diff_days} day{'s' if diff_days != 1 else ''})."
+                )
+            else:
+                different_deadlines.append(f"Both {d1[0]} and {d2[0]} share the same deadline ({d1[2].strftime('%d %b %Y')}).")
+        else:
+            # 3 documents
+            seq_str = " -> ".join([f"{item[0]} ({item[2].strftime('%d %b %Y')})" for item in dates_sorted])
+            different_deadlines.append(f"Chronological order: {seq_str}")
+    elif len(dates_with_vals) == 1 and num_docs > 1:
+        has_date = dates_with_vals[0]
+        missing_labels = [lbl for lbl, _, pdate, _ in parsed_dates if pdate is None]
+        different_deadlines.append(
+            f"Only {has_date[0]} has a confirmed deadline ({has_date[2].strftime('%d %b %Y')}); deadline is not available for {', '.join(missing_labels)}."
+        )
+    elif len(dates_with_vals) == 0:
+        different_deadlines.append("None of the selected options specify a deadline.")
+
+    # 3. Requirements Comparison (Common vs Per-Option)
+    req_sets = {}
+    normalized_map = {}
+    for idx, doc in enumerate(documents):
+        label = option_letters[idx]
+        reqs = doc.get("required_documents") or []
+        req_sets[label] = set()
+        for r in reqs:
+            cleaned = str(r).strip()
+            if cleaned:
+                key = cleaned.lower()
+                normalized_map[key] = cleaned
+                req_sets[label].add(key)
+
+    # Find common requirements across all
+    all_keys = list(req_sets.values())
+    if all_keys and all(len(s) > 0 for s in all_keys):
+        common_keys = set.intersection(*all_keys)
+    else:
+        common_keys = set()
+    common_req_items = [normalized_map[k] for k in sorted(common_keys)]
+
+    per_option_reqs = {}
+    for label, keys in req_sets.items():
+        exclusive_keys = keys - common_keys
+        per_option_reqs[label] = [normalized_map[k] for k in sorted(exclusive_keys)]
+
+    different_requirements = {
+        "common": common_req_items,
+        "per_option": per_option_reqs,
+    }
+
+    # 4. Common Information
+    common_information: List[str] = []
+    # Add Cortex common items if present
+    cortex_commons = cortex.get("common_information") or []
+    for c in cortex_commons:
+        if isinstance(c, str) and c.strip():
+            common_information.append(c.strip())
+
+    # Augment with deterministic commonalities
+    if common_req_items:
+        common_req_str = f"All selected options require: {', '.join(common_req_items)}."
+        if common_req_str not in common_information:
+            common_information.append(common_req_str)
+
+    # Check shared categories
+    categories = [d.get("category") for d in documents if d.get("category")]
+    if len(categories) == num_docs and len(set(categories)) == 1:
+        cat_note = f"All options fall under the '{categories[0]}' category."
+        if cat_note not in common_information:
+            common_information.append(cat_note)
+
+    # Check shared priorities
+    priorities = [d.get("priority") for d in documents if d.get("priority")]
+    if len(priorities) == num_docs and len(set(priorities)) == 1:
+        prio_note = f"All options share a '{priorities[0]}' priority level."
+        if prio_note not in common_information:
+            common_information.append(prio_note)
+
+    if not common_information:
+        common_information = ["No significant common information was identified across the selected records."]
+
+    # 5. Key Differences
+    differences: List[str] = []
+    cortex_diffs = cortex.get("differences") or []
+    for d in cortex_diffs:
+        if isinstance(d, str) and d.strip():
+            differences.append(d.strip())
+
+    # Add deterministic deadline difference
+    if len(dates_with_vals) >= 2:
+        d1, d2 = dates_with_vals[0], dates_with_vals[1]
+        if d1[2] != d2[2]:
+            dd_note = f"{d1[0]} deadline is {d1[2].strftime('%d %b %Y')}, whereas {d2[0]} deadline is {d2[2].strftime('%d %b %Y')}."
+            if not any("deadline" in x.lower() and d1[0] in x for x in differences):
+                differences.append(dd_note)
+
+    # Add deterministic priority difference
+    if len(set(priorities)) > 1:
+        prio_parts = [f"{option_letters[i]} is {doc.get('priority', 'Medium')}" for i, doc in enumerate(documents)]
+        prio_diff_note = f"Different priority ratings: {', '.join(prio_parts)}."
+        if not any("priority" in x.lower() for x in differences):
+            differences.append(prio_diff_note)
+
+    # Add deterministic requirement count difference
+    req_counts = [len(doc.get("required_documents") or []) for doc in documents]
+    if len(set(req_counts)) > 1:
+        if num_docs == 2:
+            cnt_diff = abs(req_counts[0] - req_counts[1])
+            more_opt = option_letters[0] if req_counts[0] > req_counts[1] else option_letters[1]
+            diff_req_note = f"{more_opt} requires {cnt_diff} additional document{'s' if cnt_diff != 1 else ''}."
+            if not any("additional document" in x.lower() for x in differences):
+                differences.append(diff_req_note)
+
+    if not differences:
+        differences = ["The selected options share largely similar parameters."]
+
+    # 6. Conflicting Information
+    conflicts: List[str] = []
+    cortex_conflicts = cortex.get("conflicts") or []
+    for cf in cortex_conflicts:
+        if isinstance(cf, str) and cf.strip():
+            cf_clean = cf.strip()
+            if cf_clean.lower() not in ("none", "no conflicts", "no conflict"):
+                conflicts.append(cf_clean)
+
+    if not conflicts or (len(conflicts) == 1 and "no conflicting information" in conflicts[0].lower()):
+        conflicts = ["No conflicting information detected."]
+
+    # 7. Missing Information
+    missing_info: List[str] = []
+    cortex_missing = cortex.get("missing_information") or []
+    for m in cortex_missing:
+        if isinstance(m, str) and m.strip():
+            m_clean = m.strip()
+            if m_clean.lower() not in ("none", "no missing information", "nothing missing", "n/a"):
+                missing_info.append(m_clean)
+
+    # Add deterministic missing checks
+    for idx, doc in enumerate(documents):
+        label = option_letters[idx]
+        if not doc.get("deadline"):
+            miss_dl = f"Deadline information is not available for {label} ({doc['title']})."
+            if not any(f"deadline" in x.lower() and label in x for x in missing_info):
+                missing_info.append(miss_dl)
+        if not doc.get("required_documents"):
+            miss_doc = f"No specific required documents are listed for {label} ({doc['title']})."
+            if not any(f"document" in x.lower() and label in x for x in missing_info):
+                missing_info.append(miss_doc)
+
+    if not missing_info or (len(missing_info) == 1 and "no important information appears to be missing" in missing_info[0].lower()):
+        missing_info = ["No important information appears to be missing from the selected records."]
+
+    # 8. Important Conditions
+    important_conditions: List[str] = []
+    cortex_conditions = cortex.get("important_conditions") or []
+    for ic in cortex_conditions:
+        if isinstance(ic, str) and ic.strip():
+            important_conditions.append(ic.strip())
+
+    if not important_conditions:
+        # Fallback to option conditions
+        for opt in options_list:
+            for c in opt.get("important_conditions", []):
+                important_conditions.append(f"{opt['title']}: {c}")
+
+    if not important_conditions:
+        important_conditions = ["No special submission or eligibility restrictions noted."]
+
+    # 9. Decision Summary (Key facts to consider)
+    decision_summary: List[str] = []
+    cortex_summary = cortex.get("decision_summary") or []
+    for item in cortex_summary:
+        sanitized = _sanitize_summary_item(item)
+        if sanitized and sanitized not in decision_summary:
+            decision_summary.append(sanitized)
+
+    # Ensure deterministic deadline fact is included if not present
+    if len(dates_with_vals) >= 2:
+        d1, d2 = dates_with_vals[0], dates_with_vals[1]
+        if d1[2] < d2[2]:
+            dl_fact = f"{d1[0]} has an earlier deadline ({d1[2].strftime('%d %b %Y')} vs {d2[2].strftime('%d %b %Y')})."
+            if not any("earlier deadline" in s.lower() for s in decision_summary):
+                decision_summary.insert(0, dl_fact)
+        elif d2[2] < d1[2]:
+            dl_fact = f"{d2[0]} has an earlier deadline ({d2[2].strftime('%d %b %Y')} vs {d1[2].strftime('%d %b %Y')})."
+            if not any("earlier deadline" in s.lower() for s in decision_summary):
+                decision_summary.insert(0, dl_fact)
+
+    # Ensure common requirements fact is included
+    if common_req_items:
+        common_fact = f"All options require: {', '.join(common_req_items)}."
+        if not any("all options require" in s.lower() or "both options require" in s.lower() for s in decision_summary):
+            decision_summary.append(common_fact)
+
+    # Ensure requirement difference fact is included
+    if len(set(req_counts)) > 1 and num_docs == 2:
+        diff_n = abs(req_counts[0] - req_counts[1])
+        more_lbl = option_letters[0] if req_counts[0] > req_counts[1] else option_letters[1]
+        req_fact = f"{more_lbl} requires {diff_n} additional document{'s' if diff_n != 1 else ''}."
+        if not any("additional document" in s.lower() for s in decision_summary):
+            decision_summary.append(req_fact)
+
+    # Check for missing eligibility warning
+    for opt in options_list:
+        if opt["eligibility"] == "Not available":
+            miss_elig = f"Check eligibility criteria for {opt['title']} before applying (not specified in record)."
+            if not any("eligibility" in s.lower() and opt['title'] in s for s in decision_summary):
+                decision_summary.append(miss_elig)
+
+    # Sanitize again
+    final_summary = []
+    for item in decision_summary:
+        s = _sanitize_summary_item(item)
+        if s and s not in final_summary:
+            final_summary.append(s)
+
+    if not final_summary:
+        final_summary = [
+            f"Review deadline differences carefully across all {num_docs} options.",
+            "Verify all required documents are prepared prior to submission.",
+            "Confirm eligibility conditions with the respective issuing authority.",
+        ]
+
+    return {
+        "options": options_list,
+        "common_information": common_information,
+        "differences": differences,
+        "conflicts": conflicts,
+        "different_deadlines": different_deadlines,
+        "different_requirements": different_requirements,
+        "missing_information": missing_info,
+        "important_conditions": important_conditions,
+        "decision_summary": final_summary,
+    }
+
+
+def compare_documents_pipeline(
+    document_ids: List[int],
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Full Decision Compare pipeline:
+    1. Verifies document count (2 to 3).
+    2. Validates session ownership and fetches structured records from DOCUMENTS.
+    3. Executes Snowflake Cortex AI comparison for semantic insights (if configured).
+    4. Computes deterministic timeline and requirements comparisons.
+    5. Returns structured comparison result.
+    """
+    if len(document_ids) < 2:
+        raise ValueError("At least 2 documents are required for comparison.")
+    if len(document_ids) > 3:
+        raise ValueError("A maximum of 3 documents can be compared at once.")
+
+    if not session_id or not str(session_id).strip():
+        raise ValueError("A valid session ID is required to compare documents.")
+
+    docs = get_documents_by_ids(document_ids, session_id=session_id)
+    if len(docs) != len(document_ids):
+        found_ids = {d["id"] for d in docs}
+        missing_ids = [did for did in document_ids if did not in found_ids]
+        logger.warning(
+            "Comparison failed: session %s does not own or could not find documents %s",
+            session_id, missing_ids,
+        )
+        raise ValueError(f"One or more documents ({missing_ids}) not found or do not belong to current session.")
+
+    cortex_data = {}
+    if SnowflakeConfig.is_configured():
+        try:
+            cortex_data = run_cortex_compare(docs)
+        except Exception as exc:
+            logger.warning("Cortex comparison call failed; falling back to deterministic comparison: %s", exc)
+
+    return build_decision_comparison(docs, cortex_data=cortex_data)
+
+
+
+
+
+# ── Deadline Center ──────────────────────────────────────────────────────────
+
+def ensure_completed_column(conn, table_name: str) -> bool:
+    """
+    Ensures the COMPLETED BOOLEAN DEFAULT FALSE column exists in the DOCUMENTS table.
+    Lazy migration — runs once on first Deadline Center access.
+    """
+    try:
+        existing = inspect_table_columns(conn, table_name)
+        if "COMPLETED" in existing:
+            return False
+        with conn.cursor() as cur:
+            cur.execute(
+                f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS COMPLETED BOOLEAN DEFAULT FALSE"
+            )
+            conn.commit()
+            logger.info("Added COMPLETED column to %s.", table_name)
+        return True
+    except Exception as exc:
+        logger.warning("Could not ensure COMPLETED column on %s: %s", table_name, exc)
+        return False
+
+
+def _compute_deadline_status(deadline_val: Any, completed: bool, today) -> tuple:
+    """
+    Computes (status, days_remaining). Completed takes precedence over date categories.
+    Returns (None, None) when deadline is absent and not completed.
+    """
+    parsed = parse_deadline_date(deadline_val)
+    if completed:
+        days = (parsed - today).days if parsed else None
+        return "Completed", days
+    if parsed is None:
+        return None, None
+    days = (parsed - today).days
+    if days < 0:
+        return "Overdue", days
+    elif days <= 7:
+        return "Due Soon", days
+    else:
+        return "Upcoming", days
+
+
+def get_deadline_items(session_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Retrieves ALL documents for the session and computes Deadline Center status.
+    Documents without a deadline are excluded unless completed.
+    """
+    if not session_id or not str(session_id).strip():
+        logger.info("get_deadline_items: no session_id — empty list.")
+        return []
+
+    conn = get_snowflake_connection()
+    table_name = SnowflakeConfig.documents_table()
+    ensure_completed_column(conn, table_name)
+    col_meta = inspect_table_columns(conn, table_name)
+    has_completed_col = "COMPLETED" in col_meta
+
+    if has_completed_col:
+        query = (
+            f"SELECT ID, TITLE, CATEGORY, SUMMARY, DEADLINE, PRIORITY, "
+            f"ACTIONS, REQUIRED_DOCUMENTS, CREATED_AT, COMPLETED "
+            f"FROM {table_name} WHERE SESSION_ID = %s "
+            f"ORDER BY CASE WHEN DEADLINE IS NULL THEN 1 ELSE 0 END ASC, "
+            f"DEADLINE ASC, CREATED_AT DESC"
+        )
+    else:
+        query = (
+            f"SELECT ID, TITLE, CATEGORY, SUMMARY, DEADLINE, PRIORITY, "
+            f"ACTIONS, REQUIRED_DOCUMENTS, CREATED_AT, FALSE AS COMPLETED "
+            f"FROM {table_name} WHERE SESSION_ID = %s "
+            f"ORDER BY CASE WHEN DEADLINE IS NULL THEN 1 ELSE 0 END ASC, "
+            f"DEADLINE ASC, CREATED_AT DESC"
+        )
+
+    kolkata_tz = timezone(timedelta(hours=5, minutes=30))
+    today = datetime.now(kolkata_tz).date()
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, (str(session_id).strip(),))
+            rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    results = []
+    for row in rows:
+        (doc_id, title, category, summary, deadline, priority,
+         actions_raw, req_docs_raw, created_at, completed_raw) = row
+
+        parsed_actions: List[str] = []
+        if actions_raw:
+            if isinstance(actions_raw, list):
+                parsed_actions = [str(a).strip() for a in actions_raw if a]
+            elif isinstance(actions_raw, str):
+                try:
+                    loaded = json.loads(actions_raw)
+                    if isinstance(loaded, list):
+                        parsed_actions = [str(a).strip() for a in loaded if a]
+                    else:
+                        parsed_actions = [str(loaded).strip()]
+                except Exception:
+                    parsed_actions = [actions_raw.strip()]
+
+        deadline_str: Optional[str] = None
+        if deadline:
+            if hasattr(deadline, "isoformat"):
+                deadline_str = deadline.isoformat()
+            else:
+                s = str(deadline).strip()
+                deadline_str = s if s and s.lower() not in ("null", "none", "n/a") else None
+
+        created_str: Optional[str] = None
+        if created_at:
+            if hasattr(created_at, "isoformat"):
+                created_str = created_at.isoformat()
+            else:
+                created_str = str(created_at).strip()
+
+        completed = bool(completed_raw) if completed_raw is not None else False
+        status, days_remaining = _compute_deadline_status(deadline_str, completed, today)
+
+        if status is None:
+            continue
+
+        required_action = parsed_actions[0] if parsed_actions else "Action not specified"
+
+        results.append({
+            "document_id": int(doc_id),
+            "task": str(title or "Untitled Document").strip(),
+            "source_document": str(title or "Untitled Document").strip(),
+            "category": str(category or "General").strip(),
+            "deadline": deadline_str,
+            "days_remaining": days_remaining,
+            "priority": str(priority or "Medium").strip().capitalize(),
+            "required_action": required_action,
+            "actions": parsed_actions,
+            "status": status,
+            "completed": completed,
+            "created_at": created_str,
+        })
+
+    return results
+
+
+def update_deadline_completion(
+    document_id: int,
+    completed: bool,
+    session_id: Optional[str] = None,
+) -> bool:
+    """
+    Persists COMPLETED state for a document with session ownership validation.
+    Returns True if updated, False if not found / not owned.
+    """
+    if not session_id or not str(session_id).strip():
+        raise ValueError("A valid session ID is required to update completion state.")
+
+    conn = get_snowflake_connection()
+    table_name = SnowflakeConfig.documents_table()
+    ensure_completed_column(conn, table_name)
+
+    query = f"UPDATE {table_name} SET COMPLETED = %s WHERE ID = %s AND SESSION_ID = %s"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, (completed, document_id, str(session_id).strip()))
+            affected = cur.rowcount
+            conn.commit()
+            logger.info(
+                "update_deadline_completion doc=%d completed=%s session=%s affected=%d",
+                document_id, completed, session_id, affected,
+            )
+            return affected > 0
+    finally:
+        conn.close()
